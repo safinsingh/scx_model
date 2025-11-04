@@ -1,0 +1,60 @@
+use super::state::{KernelCtx, TaskState};
+
+#[derive(Debug)]
+pub struct Observer {
+    step: u64,
+}
+
+impl Observer {
+    pub fn new() -> Self {
+        Self { step: 0 }
+    }
+
+    pub fn observe(&mut self, core: &KernelCtx) {
+        self.step += 1;
+
+        for cpu in &core.cpus {
+            if let Some(tid) = cpu.current {
+                let task = core
+                    .tasks
+                    .get(&tid)
+                    .expect("cpu.current references unknown task");
+                debug_assert_eq!(
+                    task.state,
+                    TaskState::Running,
+                    "cpu.current task {tid} must be Running"
+                );
+                debug_assert_eq!(
+                    task.current_cpu,
+                    Some(cpu.id),
+                    "Task {tid} metadata current_cpu mismatch"
+                );
+            }
+        }
+
+        for (tid, dsq_id) in &core.task_to_dsq {
+            let task = core
+                .tasks
+                .get(tid)
+                .expect("task_to_dsq references unknown task");
+            debug_assert_ne!(
+                task.state,
+                TaskState::Completed,
+                "Completed task {tid} still present in DSQ {dsq_id}"
+            );
+            debug_assert_ne!(
+                task.state,
+                TaskState::Running,
+                "Running task {tid} must not appear in any DSQ"
+            );
+            if let Some(dsq) = core.dsqs.get(dsq_id) {
+                debug_assert!(
+                    dsq.tasks.contains(tid),
+                    "task_to_dsq claims task {tid} in DSQ {dsq_id}, but queue does not contain it"
+                );
+            } else {
+                debug_assert!(false, "task_to_dsq references unknown DSQ {dsq_id}");
+            }
+        }
+    }
+}
