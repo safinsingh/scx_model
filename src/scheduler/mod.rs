@@ -45,7 +45,7 @@ pub trait Scheduler {
 
     fn enqueue(&mut self, ctx: &mut KernelCtx, task: TaskId, flags: EnqueueFlags, prev_cpu: CpuId);
 
-    fn dispatch(&mut self, ctx: &mut KernelCtx, cpu: CpuId) -> Result<(), DispatchError>;
+    fn dispatch(&mut self, ctx: &mut KernelCtx, cpu: CpuId);
 
     fn tick(&mut self, _ctx: &mut KernelCtx, _task: TaskId) {}
 }

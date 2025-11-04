@@ -1,6 +1,10 @@
+use num_traits::AsPrimitive;
+
 use super::job::{Job, JobInstance};
 use crate::{
+    SchedCoreEvent,
     core::{
+        TaskState,
         driver::SchedCore,
         state::{CpuId, TaskId},
     },
@@ -12,24 +16,32 @@ pub struct Sim<S: Scheduler> {
     pub core: SchedCore<S>,
     pub jobs: Vec<JobInstance>,
     job_cursor: usize,
+    num_cpus: usize,
+
     // TaskId --> job[index] map; used to propagate task completion to Job object
     tasks_to_jobs: HashMap<TaskId, usize>,
-    num_cpus: usize,
+    // For O(1) completion check
+    num_jobs_complete: usize,
 }
 
 impl<S: Scheduler> Sim<S> {
     pub fn new(mut jobs: Vec<Job>, num_cpus: usize) -> Self {
-        assert!(num_cpus > 0, "Simulation requires at least one CPU");
+        debug_assert!(num_cpus > 0, "Simulation requires at least one CPU");
+
         jobs.sort_by(|a, b| {
-            a.start_time
-                .cmp(&b.start_time)
+            a.arrival_time
+                .cmp(&b.arrival_time)
                 .then_with(|| a.id.cmp(&b.id))
         });
         let jobs = jobs
             .into_iter()
-            .map(|job| JobInstance {
-                job,
-                completion_time: None,
+            .map(|job| {
+                debug_assert!(job.run_time > 0, "Job runtime must be nonzero");
+                JobInstance {
+                    job,
+                    start_time: None,
+                    completion_time: None,
+                }
             })
             .collect();
 
@@ -37,31 +49,59 @@ impl<S: Scheduler> Sim<S> {
             core: SchedCore::<S>::new(num_cpus),
             jobs,
             job_cursor: 0,
-            tasks_to_jobs: HashMap::new(),
             num_cpus,
+            tasks_to_jobs: HashMap::new(),
+            num_jobs_complete: 0,
         }
     }
 
-    pub fn step(&mut self) {
+    pub fn step(&mut self) -> Vec<SchedCoreEvent> {
         self.handle_arrivals();
-        let completed_tasks = self.core.tick();
 
-        let completion_time = self.core.now();
-        for task in completed_tasks {
-            let job_index = *self
-                .tasks_to_jobs
-                .get(&task)
-                .expect("Completed job missing associated task");
+        let now = self.core.now();
+        let events = self.core.tick();
 
-            self.jobs[job_index].completion_time = Some(completion_time);
+        for event in events.iter() {
+            match event {
+                SchedCoreEvent::TaskStateChange {
+                    task,
+                    to: TaskState::Completed,
+                    ..
+                } => {
+                    let job_index = self
+                        .tasks_to_jobs
+                        .remove(&task)
+                        .expect("Completed job missing associated task");
+
+                    // The job was serviced during timestep "now"
+                    // We report the first full timestep during which job is complete.
+                    self.jobs[job_index].completion_time = Some(now + 1);
+                    self.num_jobs_complete += 1;
+                }
+                SchedCoreEvent::TaskStateChange {
+                    task,
+                    to: TaskState::Running,
+                    ..
+                } => {
+                    let job_index = *self
+                        .tasks_to_jobs
+                        .get(&task)
+                        .expect("Running job missing associated task");
+
+                    self.jobs[job_index].start_time.get_or_insert(now);
+                }
+                _ => {}
+            }
         }
+
+        events
     }
 
     fn handle_arrivals(&mut self) {
         let now = self.core.now();
         let arriving_jobs = self.jobs[self.job_cursor..]
             .iter_mut()
-            .take_while(|job| job.job.start_time == now); // This will be contiguous, since jobs are sorted
+            .take_while(|job| job.job.arrival_time == now); // This will be contiguous, since jobs are sorted
 
         for job in arriving_jobs {
             let task_id = self.core.ctx.create_task(job.job.run_time);
@@ -75,6 +115,13 @@ impl<S: Scheduler> Sim<S> {
     }
 
     pub fn all_jobs_completed(&self) -> bool {
-        self.jobs.iter().all(|job| job.completion_time.is_some())
+        self.num_jobs_complete == self.jobs.len()
+    }
+
+    pub fn jobs_map<T>(&self, f: impl FnMut(&JobInstance) -> T) -> impl Iterator<Item = f64>
+    where
+        T: AsPrimitive<f64>,
+    {
+        self.jobs.iter().map(f).map(|s| s.as_())
     }
 }

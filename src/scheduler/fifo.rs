@@ -1,6 +1,4 @@
-use super::{
-    Scheduler, CpuId, DispatchError, EnqueueFlags, KernelCtx, SelectCpuDecision, TaskId,
-};
+use super::{CpuId, EnqueueFlags, KernelCtx, Scheduler, SelectCpuDecision, TaskId};
 
 pub struct FifoScheduler;
 
@@ -30,7 +28,5 @@ impl Scheduler for FifoScheduler {
         ctx.dsq_push_back(dsq, task, super::SCX_SLICE_DFL);
     }
 
-    fn dispatch(&mut self, _ctx: &mut KernelCtx, _cpu: CpuId) -> Result<(), DispatchError> {
-        Err(DispatchError::NoRunnableTask)
-    }
+    fn dispatch(&mut self, _ctx: &mut KernelCtx, _cpu: CpuId) {}
 }

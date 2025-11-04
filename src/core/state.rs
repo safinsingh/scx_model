@@ -155,12 +155,23 @@ impl KernelCtx {
         self.task_to_dsq.contains_key(&task)
     }
 
+    pub fn task_state(&self, task: TaskId) -> TaskState {
+        self.tasks
+            .get(&task)
+            .expect("Queried state of invalid task")
+            .state
+    }
+
     pub fn global_dsq(&self) -> DsqId {
         self.global_dsq_id
     }
 
     pub fn per_cpu_dsq(&self, cpu: CpuId) -> DsqId {
         self.per_cpu_dsq_ids[cpu]
+    }
+
+    pub fn task_mut(&mut self, task: TaskId) -> &mut Task {
+        self.tasks.get_mut(&task).expect("Queried invalid task")
     }
 
     pub fn cpu_is_idle(&self, cpu: CpuId) -> bool {
@@ -202,7 +213,13 @@ impl KernelCtx {
             "Completing task {} that is still enqueued",
             task_id
         );
+
         let task = self.tasks.get_mut(&task_id).expect("Unknown task");
+        debug_assert!(
+            task.state == TaskState::Running,
+            "Task {task_id} must have been running before marked complete"
+        );
+
         task.state = TaskState::Completed;
         task.current_cpu = None;
         task.consumed_service = task.required_service;

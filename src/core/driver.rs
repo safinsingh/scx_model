@@ -2,15 +2,19 @@ use super::{
     observer::Observer,
     state::{CpuId, KernelCtx, TaskId, Ticks},
 };
-use crate::scheduler::{
-    DispatchError, EnqueueFlags, SCX_ENQ_CPU_SELECTED, SCX_ENQ_PREEMPT, SCX_ENQ_REENQ,
-    SCX_ENQ_WAKEUP, Scheduler, SelectCpuDecision,
+use crate::{
+    core::{TaskState, event::SchedCoreEvent},
+    scheduler::{
+        EnqueueFlags, SCX_ENQ_CPU_SELECTED, SCX_ENQ_REENQ, SCX_ENQ_WAKEUP, Scheduler,
+        SelectCpuDecision,
+    },
 };
 
 pub struct SchedCore<S: Scheduler> {
     pub ctx: KernelCtx,
     pub scheduler: S,
     observer: Observer,
+    events: Vec<SchedCoreEvent>,
 }
 
 impl<S: Scheduler> SchedCore<S> {
@@ -22,104 +26,123 @@ impl<S: Scheduler> SchedCore<S> {
             ctx,
             scheduler,
             observer,
+            events: Vec::new(),
         }
     }
 
-    pub fn tick(&mut self) -> Vec<TaskId> {
-        self.ctx.advance_time(1);
-        let mut completed = Vec::new();
-        let cpu_count = self.ctx.cpus.len();
-        for cpu in 0..cpu_count {
-            if let Some(task) = self.tick_cpu(cpu) {
-                completed.push(task);
-            }
+    pub fn tick(&mut self) -> Vec<SchedCoreEvent> {
+        for cpu in 0..self.ctx.cpus.len() {
+            self.schedule_cpu(cpu);
+        }
+        for cpu in 0..self.ctx.cpus.len() {
+            self.tick_cpu(cpu);
         }
         self.observer.observe(&self.ctx);
-        completed
+
+        self.ctx.advance_time(1);
+        std::mem::take(&mut self.events)
     }
 
-    // Return TaskId if the current task has completed upon tick()
-    fn tick_cpu(&mut self, cpu: CpuId) -> Option<TaskId> {
-        // Attempt to give `cpu` work if it's idle:
-        // 1. Pull from local, per-CPU DSQ
-        // 2. Pull from global DSQ
-        // 3. Call ops->dispatch() to fill local, per-CPU DSQ
-        if self.ctx.cpu_is_idle(cpu) {
-            self.try_schedule_cpu(cpu);
-        }
-
-        let current_task_id = match self.ctx.cpus[cpu].current {
-            Some(task) => task,
-            None => return None,
+    fn tick_cpu(&mut self, cpu: CpuId) {
+        let Some(current_task_id) = self.ctx.cpus[cpu].current else {
+            self.events.push(SchedCoreEvent::CpuIdle { cpu });
+            return;
         };
 
         // Increment service/decrement slice for current task
+        // THIS IS THE ACTUAL "TIME BETWEEN TICKS"
         // In its own block to avoid double-mutable-borrow
         {
-            let task = self
-                .ctx
-                .tasks
-                .get_mut(&current_task_id)
-                .expect("Running task missing from task table");
+            let task = self.ctx.task_mut(current_task_id);
             task.consumed_service = task.consumed_service.saturating_add(1);
-            task.consumed_timeslice = task.consumed_service.saturating_add(1);
+            task.consumed_timeslice = task.consumed_timeslice.saturating_add(1);
         }
+
+        // The following occurs "at the end" of the tick
 
         // Invoke BPF ops->tick()
         self.scheduler.tick(&mut self.ctx, current_task_id);
 
-        let task = self
-            .ctx
-            .tasks
-            .get(&current_task_id)
-            .expect("Running task missing from task table after tick()");
+        let task = self.ctx.task_mut(current_task_id);
         let completed = task.consumed_service >= task.required_service;
         let slice_expired = task.consumed_timeslice
             == task
                 .allocated_timeslice
-                .expect("Task must has an unset timeslice")
+                .expect("Task has an unset timeslice")
             && !completed;
 
+        if !completed && !slice_expired {
+            return;
+        }
+
+        // Common "deschedule" path
+        self.ctx.clear_cpu(cpu);
+        self.events.push(SchedCoreEvent::CpuCurrentChange {
+            cpu,
+            from: Some(current_task_id),
+            to: None,
+        });
+
         if completed {
-            self.ctx.clear_cpu(cpu);
             self.ctx.mark_completed(current_task_id, self.ctx.now);
-            return Some(current_task_id);
-        }
-
-        if slice_expired {
-            self.ctx.clear_cpu(cpu);
+            self.events.push(SchedCoreEvent::TaskStateChange {
+                task: current_task_id,
+                from: TaskState::Running,
+                to: TaskState::Completed,
+            });
+        } else {
+            // Slice expired
             self.ctx.mark_runnable(current_task_id);
-            let flags: EnqueueFlags = SCX_ENQ_PREEMPT | SCX_ENQ_REENQ;
+            self.events.push(SchedCoreEvent::TaskStateChange {
+                task: current_task_id,
+                from: TaskState::Running,
+                to: TaskState::Runnable,
+            });
             self.scheduler
-                .enqueue(&mut self.ctx, current_task_id, flags, cpu);
+                .enqueue(&mut self.ctx, current_task_id, SCX_ENQ_REENQ, cpu);
         }
-
-        None
     }
 
-    fn try_schedule_cpu(&mut self, cpu: CpuId) {
-        if let Some(task) = self.ctx.dsq_pop_front(self.ctx.per_cpu_dsq(cpu)) {
-            self.ctx.set_running(cpu, task);
+    // Attempt to give `cpu` work if it's idle:
+    // 1. Pull from local, per-CPU DSQ
+    // 2. Pull from global DSQ
+    // 3. Call ops->dispatch() to fill local, per-CPU DSQ
+    fn schedule_cpu(&mut self, cpu: CpuId) {
+        if !self.ctx.cpu_is_idle(cpu) {
             return;
         }
 
-        if let Some(task) = self.ctx.dsq_pop_front(self.ctx.global_dsq()) {
-            self.ctx.set_running(cpu, task);
-            return;
-        }
+        let maybe_next_task = self
+            .ctx
+            .dsq_pop_front(self.ctx.per_cpu_dsq(cpu))
+            .or_else(|| self.ctx.dsq_pop_front(self.ctx.global_dsq()))
+            .or_else(|| {
+                self.scheduler.dispatch(&mut self.ctx, cpu);
+                self.ctx.dsq_pop_front(self.ctx.per_cpu_dsq(cpu))
+            });
 
-        if let Err(DispatchError::NoRunnableTask) = self.scheduler.dispatch(&mut self.ctx, cpu) {
-            // Scheduler left CPU idle.
-        }
-
-        if let Some(task) = self.ctx.dsq_pop_front(self.ctx.per_cpu_dsq(cpu)) {
+        if let Some(task) = maybe_next_task {
+            let prev_state = self.ctx.task_state(task);
             self.ctx.set_running(cpu, task);
-            return;
+
+            self.events.extend(vec![
+                SchedCoreEvent::TaskStateChange {
+                    task,
+                    from: prev_state,
+                    to: TaskState::Running,
+                },
+                SchedCoreEvent::CpuCurrentChange {
+                    cpu,
+                    from: None,
+                    to: Some(task),
+                },
+            ]);
         }
     }
 
     pub fn wake_task(&mut self, task: TaskId, wakeup_cpu: CpuId) {
         self.ctx.mark_runnable(task);
+
         match self.scheduler.select_cpu(&mut self.ctx, task, wakeup_cpu) {
             SelectCpuDecision::DirectDispatch(cpu, slice) => {
                 let dsq = self.ctx.per_cpu_dsq(cpu);
