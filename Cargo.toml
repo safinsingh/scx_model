@@ -9,6 +9,8 @@ keyed_priority_queue = "0.4.2"
 num-traits = "0.2.19"
 rand = "0.9.2"
 rand_distr = "0.5.1"
+rustc-hash = "2.1.0"
+slotmap = "1.0.7"
 
 [lib]
 path = "src/lib.rs"

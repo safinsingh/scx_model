@@ -124,11 +124,10 @@ impl<S: Scheduler> SchedCore<S> {
             });
 
         if let Some(task) = maybe_next_task {
-            let prev_state = self.ctx.task(task).state;
-            self.ctx.set_running(cpu, task);
+            let prev_state = self.ctx.set_running(cpu, task);
             self.scheduler.running(&mut self.ctx, task);
 
-            self.events.extend(vec![
+            self.events.extend([
                 SchedCoreEvent::TaskStateChange {
                     task,
                     from: prev_state,

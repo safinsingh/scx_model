@@ -15,10 +15,7 @@ impl Observer {
 
         for cpu in &core.cpus {
             if let Some(tid) = cpu.current {
-                let task = core
-                    .tasks
-                    .get(&tid)
-                    .expect("cpu.current references unknown task");
+                let task = &core.tasks[tid];
                 debug_assert_eq!(
                     task.state,
                     TaskState::Running,
@@ -32,15 +29,12 @@ impl Observer {
             }
         }
 
-        for (tid, dsq_id) in &core.task_to_dsq {
-            let task = core
-                .tasks
-                .get(tid)
-                .expect("task_to_dsq references unknown task");
+        for (&tid, &dsq_id) in &core.task_to_dsq {
+            let task = &core.tasks[tid];
             debug_assert_ne!(
                 task.state,
                 TaskState::Completed,
-                "Completed task {tid} still present in DSQ {dsq_id}"
+                "Completed task {tid} still present in DSQ {dsq_id:?}"
             );
             debug_assert_ne!(
                 task.state,
@@ -49,11 +43,11 @@ impl Observer {
             );
             if let Some(dsq) = core.dsqs.get(dsq_id) {
                 debug_assert!(
-                    dsq.contains(*tid),
-                    "task_to_dsq claims task {tid} in DSQ {dsq_id}, but queue does not contain it"
+                    dsq.contains(tid),
+                    "task_to_dsq claims task {tid} in DSQ {dsq_id:?}, but queue does not contain it"
                 );
             } else {
-                debug_assert!(false, "task_to_dsq references unknown DSQ {dsq_id}");
+                debug_assert!(false, "task_to_dsq references unknown DSQ {dsq_id:?}");
             }
         }
     }

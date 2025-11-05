@@ -1,10 +1,15 @@
 use keyed_priority_queue::KeyedPriorityQueue;
-use std::collections::{HashMap, VecDeque};
+use rustc_hash::FxHashMap;
+use slotmap::{SlotMap, new_key_type};
+use std::collections::VecDeque;
 
-pub type TaskId = u64;
+// Index into Task Vec
+pub type TaskId = usize;
 pub type CpuId = usize;
-pub type DsqId = u64;
 pub type Ticks = u64;
+new_key_type! {
+    pub struct DsqId;
+}
 
 #[derive(PartialEq, Eq, Hash, Debug, Copy, Clone)]
 pub struct Vtime(pub u64);
@@ -85,42 +90,42 @@ impl Dsq {
 pub struct KernelCtx {
     pub now: Ticks,
     pub cpus: Vec<CpuState>,
-    pub tasks: HashMap<TaskId, Task>,
-    pub dsqs: HashMap<DsqId, Dsq>,
-    pub task_to_dsq: HashMap<TaskId, DsqId>,
+    pub tasks: Vec<Task>,
+    pub dsqs: SlotMap<DsqId, Dsq>,
+    pub task_to_dsq: FxHashMap<TaskId, DsqId>,
     pub global_dsq_id: DsqId,
     pub per_cpu_dsq_ids: Vec<DsqId>,
 
-    // Increment upon task/DSQ creation
+    // Increment upon task creation
     next_task_id: TaskId,
-    next_dsq_id: DsqId,
 }
 
 impl KernelCtx {
     pub fn new(num_cpus: usize) -> Self {
-        let mut state = Self {
+        let mut dsqs = SlotMap::with_capacity_and_key(1 + num_cpus);
+
+        // Create global DSQ
+        let global_dsq_id = dsqs.insert(Dsq::new_fifo());
+
+        // Create per-CPU DSQs
+        let mut per_cpu_dsq_ids = Vec::with_capacity(num_cpus);
+        for _ in 0..num_cpus {
+            let dsq_id = dsqs.insert(Dsq::new_fifo());
+            per_cpu_dsq_ids.push(dsq_id);
+        }
+
+        Self {
             now: 0,
             cpus: (0..num_cpus)
                 .map(|id| CpuState { id, current: None })
                 .collect(),
-            tasks: HashMap::new(),
-            dsqs: HashMap::new(),
-            task_to_dsq: HashMap::new(),
-            global_dsq_id: 0,
-            per_cpu_dsq_ids: Vec::with_capacity(num_cpus),
+            tasks: Vec::new(),
+            dsqs,
+            task_to_dsq: FxHashMap::default(),
+            global_dsq_id,
+            per_cpu_dsq_ids,
             next_task_id: 0,
-            next_dsq_id: 0,
-        };
-
-        let global_dsq_id = state.create_dsq_fifo();
-        state.global_dsq_id = global_dsq_id;
-
-        for _ in 0..num_cpus {
-            let dsq_id = state.create_dsq_fifo();
-            state.per_cpu_dsq_ids.push(dsq_id);
         }
-
-        state
     }
 
     pub fn create_task(&mut self, required_service: Ticks, weight: u64) -> TaskId {
@@ -140,8 +145,8 @@ impl KernelCtx {
             weight,
         };
 
-        let old = self.tasks.insert(id, task);
-        debug_assert!(old.is_none(), "TaskId collision");
+        debug_assert_eq!(self.tasks.len(), id, "TaskId must match Vec index");
+        self.tasks.push(task);
 
         id
     }
@@ -151,19 +156,11 @@ impl KernelCtx {
     }
 
     pub fn create_dsq_fifo(&mut self) -> DsqId {
-        let id = self.next_dsq_id;
-        self.next_dsq_id += 1;
-        let previous = self.dsqs.insert(id, Dsq::new_fifo());
-        debug_assert!(previous.is_none(), "DSQ ID collision");
-        id
+        self.dsqs.insert(Dsq::new_fifo())
     }
 
     pub fn create_dsq_priq(&mut self) -> DsqId {
-        let id = self.next_dsq_id;
-        self.next_dsq_id += 1;
-        let previous = self.dsqs.insert(id, Dsq::new_priq());
-        debug_assert!(previous.is_none(), "DSQ ID collision");
-        id
+        self.dsqs.insert(Dsq::new_priq())
     }
 
     fn dsq_push(&mut self, dsq_id: DsqId, task_id: TaskId, slice: Ticks, vtime: Option<Vtime>) {
@@ -172,17 +169,14 @@ impl KernelCtx {
             "Task {task_id} already present in some DSQ"
         );
 
-        let task = self
-            .tasks
-            .get_mut(&task_id)
-            .expect(&format!("Attempting to enqueue unknown task {task_id}"));
+        let task = self.task_mut(task_id);
         debug_assert!(
             task.state != TaskState::Completed && task.state != TaskState::Running,
             "Task {task_id} must not be Running or Completed when enqueued"
         );
 
         task.allocated_timeslice = Some(slice);
-        let dsq = self.dsqs.get_mut(&dsq_id).expect("Unknown DSQ");
+        let dsq = self.dsqs.get_mut(dsq_id).expect("Unknown DSQ");
 
         match dsq {
             Dsq::Fifo { tasks } => tasks.push_back(task_id),
@@ -205,25 +199,8 @@ impl KernelCtx {
         self.dsq_push(dsq_id, task_id, slice, Some(vtime));
     }
 
-    pub fn task_add_vtime(&mut self, task_id: TaskId, vtime: u64) {
-        let dsq_id = self
-            .task_to_dsq
-            .get(&task_id)
-            .expect("Task must be in DSQ to set vtime");
-        let Dsq::Priq { tasks } = self.dsqs.get_mut(&dsq_id).expect("Unknown DSQ") else {
-            panic!("Attempted to set priority on non-PriqDsq")
-        };
-
-        let priority = *tasks
-            .get_priority(&task_id)
-            .expect("Attempted to get priority of invalid task");
-        tasks
-            .set_priority(&task_id, Vtime(priority.0 + vtime))
-            .unwrap();
-    }
-
     pub fn dsq_pop(&mut self, dsq_id: DsqId) -> Option<TaskId> {
-        let dsq = self.dsqs.get_mut(&dsq_id)?;
+        let dsq = self.dsqs.get_mut(dsq_id)?;
         let task = match dsq {
             Dsq::Fifo { tasks } => tasks.pop_front(),
             Dsq::Priq { tasks } => tasks.pop().map(|t| t.0),
@@ -247,16 +224,16 @@ impl KernelCtx {
         }
     }
 
-    pub fn task_in_any_dsq(&self, task: TaskId) -> bool {
-        self.task_to_dsq.contains_key(&task)
+    pub fn task_in_any_dsq(&self, task_id: TaskId) -> bool {
+        self.task_to_dsq.contains_key(&task_id)
     }
 
-    pub fn task(&self, task: TaskId) -> &Task {
-        self.tasks.get(&task).expect("Queried invalid task")
+    pub fn task(&self, task_id: TaskId) -> &Task {
+        &self.tasks[task_id]
     }
 
-    pub fn task_mut(&mut self, task: TaskId) -> &mut Task {
-        self.tasks.get_mut(&task).expect("Queried invalid task")
+    pub fn task_mut(&mut self, task_id: TaskId) -> &mut Task {
+        &mut self.tasks[task_id]
     }
 
     pub fn global_dsq(&self) -> DsqId {
@@ -279,7 +256,7 @@ impl KernelCtx {
     }
 
     pub fn mark_runnable(&mut self, task_id: TaskId) {
-        let task = self.tasks.get_mut(&task_id).expect("Unknown task");
+        let task = self.task_mut(task_id);
         debug_assert!(
             task.state != TaskState::Completed,
             "Completed task {} cannot be runnable",
@@ -295,7 +272,7 @@ impl KernelCtx {
             "Blocking task {} that is still enqueued",
             task_id
         );
-        let task = self.tasks.get_mut(&task_id).expect("Unknown task");
+        let task = self.task_mut(task_id);
         task.state = TaskState::Blocked;
         task.current_cpu = None;
     }
@@ -307,7 +284,7 @@ impl KernelCtx {
             task_id
         );
 
-        let task = self.tasks.get_mut(&task_id).expect("Unknown task");
+        let task = &mut self.tasks[task_id];
         debug_assert!(
             task.state == TaskState::Running,
             "Task {task_id} must have been running before marked complete"
@@ -319,20 +296,23 @@ impl KernelCtx {
         task.completion_time = Some(completion_time);
     }
 
-    pub fn set_running(&mut self, cpu: CpuId, task: TaskId) {
+    // Return previous state (runnable, but possibly blocked if ddsp'd)
+    pub fn set_running(&mut self, cpu: CpuId, task_id: TaskId) -> TaskState {
         debug_assert!(
-            !self.task_to_dsq.contains_key(&task),
-            "Running task {task} must not be enqueued"
+            !self.task_to_dsq.contains_key(&task_id),
+            "Running task {task_id} must not be enqueued"
         );
         debug_assert!(
             self.cpus[cpu].current.is_none(),
             "CPU {cpu} already running a task"
         );
 
-        self.cpus[cpu].current = Some(task);
-        let task_state = self.tasks.get_mut(&task).expect("Unknown task");
+        self.cpus[cpu].current = Some(task_id);
+        let task_state = self.task_mut(task_id);
+        let prev_state = task_state.state;
         task_state.state = TaskState::Running;
         task_state.current_cpu = Some(cpu);
+        prev_state
     }
 
     pub fn clear_cpu(&mut self, cpu: CpuId) {

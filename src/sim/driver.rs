@@ -1,16 +1,12 @@
 use num_traits::AsPrimitive;
+use rustc_hash::FxHashMap;
 
 use super::job::{Job, JobInstance};
 use crate::{
     SchedCoreEvent,
-    core::{
-        TaskState,
-        driver::SchedCore,
-        state::{CpuId, TaskId},
-    },
+    core::{TaskId, TaskState, driver::SchedCore, state::CpuId},
     scheduler::Scheduler,
 };
-use std::collections::HashMap;
 
 pub struct Sim<S: Scheduler> {
     pub core: SchedCore<S>,
@@ -19,7 +15,7 @@ pub struct Sim<S: Scheduler> {
     num_cpus: usize,
 
     // TaskId --> job[index] map; used to propagate task completion to Job object
-    tasks_to_jobs: HashMap<TaskId, usize>,
+    tasks_to_jobs: FxHashMap<TaskId, usize>,
     // For O(1) completion check
     num_jobs_complete: usize,
 }
@@ -50,7 +46,7 @@ impl<S: Scheduler> Sim<S> {
             jobs,
             job_cursor: 0,
             num_cpus,
-            tasks_to_jobs: HashMap::new(),
+            tasks_to_jobs: FxHashMap::default(),
             num_jobs_complete: 0,
         }
     }

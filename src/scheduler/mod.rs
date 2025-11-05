@@ -22,11 +22,6 @@ pub const SCX_ENQ_DSQ_PRIQ: EnqueueFlags = 1 << 57;
 pub const SCX_SLICE_DFL: u64 = 3;
 
 #[derive(Debug)]
-pub enum DispatchError {
-    NoRunnableTask,
-}
-
-#[derive(Debug)]
 pub enum SelectCpuDecision {
     DirectDispatch(CpuId, Ticks),
     EnqueueOn(CpuId),
