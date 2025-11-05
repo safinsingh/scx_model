@@ -20,12 +20,11 @@ impl Scheduler for FifoScheduler {
         &mut self,
         ctx: &mut KernelCtx,
         task: TaskId,
-        flags: EnqueueFlags,
+        _flags: EnqueueFlags,
         _prev_cpu: CpuId,
     ) {
-        let _ = flags;
         let dsq = ctx.global_dsq();
-        ctx.dsq_push_back(dsq, task, super::SCX_SLICE_DFL);
+        ctx.dsq_push_fifo(dsq, task, super::SCX_SLICE_DFL);
     }
 
     fn dispatch(&mut self, _ctx: &mut KernelCtx, _cpu: CpuId) {}

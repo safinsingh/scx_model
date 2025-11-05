@@ -104,7 +104,7 @@ impl<S: Scheduler> Sim<S> {
             .take_while(|job| job.job.arrival_time == now); // This will be contiguous, since jobs are sorted
 
         for job in arriving_jobs {
-            let task_id = self.core.ctx.create_task(job.job.run_time);
+            let task_id = self.core.create_task(job.job.run_time, job.job.weight);
             self.tasks_to_jobs.insert(task_id, self.job_cursor);
 
             let wakeup_cpu = (job.job.id % self.num_cpus as u64) as CpuId;
@@ -123,5 +123,16 @@ impl<S: Scheduler> Sim<S> {
         T: AsPrimitive<f64>,
     {
         self.jobs.iter().map(f).map(|s| s.as_())
+    }
+
+    pub fn jobs_filter_map<T>(
+        &self,
+        f: impl FnMut(&&JobInstance) -> bool,
+        m: impl FnMut(&JobInstance) -> T,
+    ) -> impl Iterator<Item = f64>
+    where
+        T: AsPrimitive<f64>,
+    {
+        self.jobs.iter().filter(f).map(m).map(|s| s.as_())
     }
 }

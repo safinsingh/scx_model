@@ -1,9 +1,13 @@
+use keyed_priority_queue::KeyedPriorityQueue;
 use std::collections::{HashMap, VecDeque};
 
 pub type TaskId = u64;
 pub type CpuId = usize;
 pub type DsqId = u64;
 pub type Ticks = u64;
+
+#[derive(PartialEq, Eq, Hash, Debug, Copy, Clone)]
+pub struct Vtime(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -23,6 +27,8 @@ pub struct Task {
     pub allocated_timeslice: Option<Ticks>,
     pub consumed_timeslice: Ticks,
     pub completion_time: Option<Ticks>,
+    pub vtime: u64,
+    pub weight: u64,
 }
 
 #[derive(Debug)]
@@ -31,15 +37,46 @@ pub struct CpuState {
     pub current: Option<TaskId>,
 }
 
+// KeyedPriorityQueue is a max-heap, so we need to flip-flop Vtime's Ord
+impl PartialOrd for Vtime {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        other.0.partial_cmp(&self.0)
+    }
+}
+
+impl Ord for Vtime {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.0.cmp(&self.0)
+    }
+}
+
 #[derive(Debug)]
-pub struct Dsq {
-    pub tasks: VecDeque<TaskId>,
+pub enum Dsq {
+    Fifo {
+        tasks: VecDeque<TaskId>,
+    },
+    Priq {
+        tasks: KeyedPriorityQueue<TaskId, Vtime>,
+    },
 }
 
 impl Dsq {
-    pub fn new() -> Self {
-        Self {
+    pub fn new_fifo() -> Self {
+        Self::Fifo {
             tasks: VecDeque::new(),
+        }
+    }
+
+    pub fn new_priq() -> Self {
+        Self::Priq {
+            tasks: KeyedPriorityQueue::new(),
+        }
+    }
+
+    pub fn contains(&self, task_id: TaskId) -> bool {
+        match self {
+            Self::Fifo { tasks } => tasks.contains(&task_id),
+            Self::Priq { tasks } => tasks.iter().any(|t| *t.0 == task_id),
         }
     }
 }
@@ -75,18 +112,18 @@ impl KernelCtx {
             next_dsq_id: 0,
         };
 
-        let global_dsq_id = state.create_dsq();
+        let global_dsq_id = state.create_dsq_fifo();
         state.global_dsq_id = global_dsq_id;
 
         for _ in 0..num_cpus {
-            let dsq_id = state.create_dsq();
+            let dsq_id = state.create_dsq_fifo();
             state.per_cpu_dsq_ids.push(dsq_id);
         }
 
         state
     }
 
-    pub fn create_task(&mut self, required_service: Ticks) -> TaskId {
+    pub fn create_task(&mut self, required_service: Ticks, weight: u64) -> TaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
 
@@ -99,6 +136,8 @@ impl KernelCtx {
             allocated_timeslice: None,
             consumed_timeslice: 0,
             completion_time: None,
+            vtime: 0,
+            weight,
         };
 
         let old = self.tasks.insert(id, task);
@@ -111,15 +150,23 @@ impl KernelCtx {
         self.now = self.now.saturating_add(delta);
     }
 
-    pub fn create_dsq(&mut self) -> DsqId {
+    pub fn create_dsq_fifo(&mut self) -> DsqId {
         let id = self.next_dsq_id;
         self.next_dsq_id += 1;
-        let previous = self.dsqs.insert(id, Dsq::new());
+        let previous = self.dsqs.insert(id, Dsq::new_fifo());
         debug_assert!(previous.is_none(), "DSQ ID collision");
         id
     }
 
-    pub fn dsq_push_back(&mut self, dsq_id: DsqId, task_id: TaskId, slice: Ticks) {
+    pub fn create_dsq_priq(&mut self) -> DsqId {
+        let id = self.next_dsq_id;
+        self.next_dsq_id += 1;
+        let previous = self.dsqs.insert(id, Dsq::new_priq());
+        debug_assert!(previous.is_none(), "DSQ ID collision");
+        id
+    }
+
+    fn dsq_push(&mut self, dsq_id: DsqId, task_id: TaskId, slice: Ticks, vtime: Option<Vtime>) {
         assert!(
             !self.task_to_dsq.contains_key(&task_id),
             "Task {task_id} already present in some DSQ"
@@ -136,14 +183,51 @@ impl KernelCtx {
 
         task.allocated_timeslice = Some(slice);
         let dsq = self.dsqs.get_mut(&dsq_id).expect("Unknown DSQ");
-        dsq.tasks.push_back(task_id);
+
+        match dsq {
+            Dsq::Fifo { tasks } => tasks.push_back(task_id),
+            Dsq::Priq { tasks } => {
+                tasks.push(
+                    task_id,
+                    vtime.expect("Attempted to push to a PrioDsq with no vtime"),
+                );
+            }
+        };
 
         self.task_to_dsq.insert(task_id, dsq_id);
     }
 
-    pub fn dsq_pop_front(&mut self, dsq_id: DsqId) -> Option<TaskId> {
+    pub fn dsq_push_fifo(&mut self, dsq_id: DsqId, task_id: TaskId, slice: Ticks) {
+        self.dsq_push(dsq_id, task_id, slice, None);
+    }
+
+    pub fn dsq_push_priq(&mut self, dsq_id: DsqId, task_id: TaskId, slice: Ticks, vtime: Vtime) {
+        self.dsq_push(dsq_id, task_id, slice, Some(vtime));
+    }
+
+    pub fn task_add_vtime(&mut self, task_id: TaskId, vtime: u64) {
+        let dsq_id = self
+            .task_to_dsq
+            .get(&task_id)
+            .expect("Task must be in DSQ to set vtime");
+        let Dsq::Priq { tasks } = self.dsqs.get_mut(&dsq_id).expect("Unknown DSQ") else {
+            panic!("Attempted to set priority on non-PriqDsq")
+        };
+
+        let priority = *tasks
+            .get_priority(&task_id)
+            .expect("Attempted to get priority of invalid task");
+        tasks
+            .set_priority(&task_id, Vtime(priority.0 + vtime))
+            .unwrap();
+    }
+
+    pub fn dsq_pop(&mut self, dsq_id: DsqId) -> Option<TaskId> {
         let dsq = self.dsqs.get_mut(&dsq_id)?;
-        let task = dsq.tasks.pop_front()?;
+        let task = match dsq {
+            Dsq::Fifo { tasks } => tasks.pop_front(),
+            Dsq::Priq { tasks } => tasks.pop().map(|t| t.0),
+        }?;
 
         let removed = self.task_to_dsq.remove(&task);
         debug_assert!(removed.is_some(), "Task {task} missing DSQ membership");
@@ -151,15 +235,28 @@ impl KernelCtx {
         Some(task)
     }
 
+    pub fn dsq_move_to_local(&mut self, dsq_id: DsqId, cpu: CpuId) {
+        if let Some(task) = self.dsq_pop(dsq_id) {
+            self.dsq_push_fifo(
+                self.per_cpu_dsq(cpu),
+                task,
+                self.task(task)
+                    .allocated_timeslice
+                    .expect("Task on DSQ must have slice"),
+            );
+        }
+    }
+
     pub fn task_in_any_dsq(&self, task: TaskId) -> bool {
         self.task_to_dsq.contains_key(&task)
     }
 
-    pub fn task_state(&self, task: TaskId) -> TaskState {
-        self.tasks
-            .get(&task)
-            .expect("Queried state of invalid task")
-            .state
+    pub fn task(&self, task: TaskId) -> &Task {
+        self.tasks.get(&task).expect("Queried invalid task")
+    }
+
+    pub fn task_mut(&mut self, task: TaskId) -> &mut Task {
+        self.tasks.get_mut(&task).expect("Queried invalid task")
     }
 
     pub fn global_dsq(&self) -> DsqId {
@@ -168,10 +265,6 @@ impl KernelCtx {
 
     pub fn per_cpu_dsq(&self, cpu: CpuId) -> DsqId {
         self.per_cpu_dsq_ids[cpu]
-    }
-
-    pub fn task_mut(&mut self, task: TaskId) -> &mut Task {
-        self.tasks.get_mut(&task).expect("Queried invalid task")
     }
 
     pub fn cpu_is_idle(&self, cpu: CpuId) -> bool {

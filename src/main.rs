@@ -1,15 +1,34 @@
 use average::Estimate;
 use rand::prelude::*;
-use scx_model::{Job, SchedCoreEvent, Sim, scheduler::FifoScheduler};
+use rand_distr::Poisson;
+use scx_model::{
+    Job, SchedCoreEvent, Sim,
+    core::Ticks,
+    scheduler::{FifoScheduler, PriqScheduler},
+    sim::JobId,
+};
+use std::{cmp, ops::Range};
 
 fn main() {
-    let jobs = bernoulli_jobs(500, 0.3, 0.3, 2, 6, 0);
-    let num_cpus = 2;
-    let mut sim = Sim::<FifoScheduler>::new(jobs, num_cpus);
+    let jobs = JobGenerator {
+        seed: 0,
+        // Latest job arrival
+        horizon: 1000,
+        // E[jobs/timestep]
+        lambda: 1.0,
+        // Proportion of heavy-weight jobs
+        p_weighted: 0.3,
+        // Simulate bimodal job length
+        p_hit: 0.2,
+        cache_hit_range: 1..3,
+        cache_miss_range: 6..10,
+    }
+    .generate();
+    let num_cpus = 8;
+    let mut sim = Sim::<PriqScheduler>::new(jobs, num_cpus);
 
     let mut current_idle = vec![0; num_cpus];
     let mut max_idle = 0;
-
     while !sim.all_jobs_completed() {
         let now = sim.core.now();
         let events = sim.step();
@@ -27,50 +46,83 @@ fn main() {
         for cpu in 0..num_cpus {
             if got_idle[cpu] {
                 current_idle[cpu] += 1;
-                max_idle = max_idle.max(current_idle[cpu]);
+                max_idle = cmp::max(max_idle, current_idle[cpu]);
             } else {
                 current_idle[cpu] = 0;
             }
         }
     }
 
-    let offcpu_times = sim.jobs_map(|j| j.completion_time.unwrap() - j.start_time.unwrap());
-    let response_times = sim.jobs_map(|j| j.start_time.unwrap() - j.job.arrival_time);
+    let heavy_slowdowns = sim.jobs_filter_map(
+        |j| j.job.weight == 10000,
+        |j| (j.completion_time.unwrap() as f64 - j.job.arrival_time as f64) / j.job.run_time as f64,
+    );
+    let normal_slowdowns = sim.jobs_filter_map(
+        |j| j.job.weight == 100,
+        |j| (j.completion_time.unwrap() as f64 - j.job.arrival_time as f64) / j.job.run_time as f64,
+    );
 
-    // Time to first run
-    println!("Average response time: {:.2} ticks", avg(response_times));
-    println!("Average offcpu time: {:.2} ticks", avg(offcpu_times));
+    println!("Average heavy slowdown: {:.3}", avg(heavy_slowdowns));
+    println!("Average normal slowdown: {:.3}", avg(normal_slowdowns));
     println!("Longest starvation period: {:?} ticks", max_idle);
 }
 
-fn bernoulli_jobs(
-    ticks: u64,
-    p_arrival: f64,
-    p_short: f64,
-    short_ticks: u64,
-    long_ticks: u64,
+/// HELPERS ///
+
+struct JobGenerator {
     seed: u64,
-) -> Vec<Job> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut jobs = Vec::new();
+    horizon: Ticks,
+    lambda: f64,
+    p_weighted: f64,
+    p_hit: f64,
+    cache_hit_range: Range<Ticks>,
+    cache_miss_range: Range<Ticks>,
+}
 
-    for t in 0..ticks {
-        if rng.random::<f64>() < p_arrival {
-            let run_time = if rng.random::<f64>() < p_short {
-                short_ticks
-            } else {
-                long_ticks
-            };
+impl JobGenerator {
+    fn generate(self) -> Vec<Job> {
+        let Self {
+            seed,
+            horizon,
+            lambda,
+            p_weighted,
+            p_hit,
+            cache_hit_range,
+            cache_miss_range,
+        } = self;
 
-            jobs.push(Job {
-                id: jobs.len() as u64,
-                arrival_time: t,
-                run_time,
-            });
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let poisson = Poisson::new(lambda).expect("invalid lambda for Poisson");
+        let mut jobs = Vec::with_capacity((lambda * horizon as f64) as usize);
+        let mut next_id: JobId = 0;
+
+        for t in 0..horizon {
+            let arrivals = poisson.sample(&mut rng) as u64;
+            for _ in 0..arrivals {
+                let is_hit = rng.random_bool(p_hit);
+                let run_time = rng.random_range(if is_hit {
+                    cache_hit_range.clone()
+                } else {
+                    cache_miss_range.clone()
+                });
+                let weight = if rng.random_bool(p_weighted) {
+                    10000
+                } else {
+                    100
+                };
+
+                jobs.push(Job {
+                    id: next_id,
+                    arrival_time: t,
+                    run_time,
+                    weight,
+                });
+                next_id += 1;
+            }
         }
-    }
 
-    jobs
+        jobs
+    }
 }
 
 fn avg(iter: impl Iterator<Item = f64>) -> f64 {

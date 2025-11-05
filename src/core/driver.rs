@@ -76,6 +76,8 @@ impl<S: Scheduler> SchedCore<S> {
         }
 
         // Common "deschedule" path
+        self.scheduler
+            .stopping(&mut self.ctx, current_task_id, !completed);
         self.ctx.clear_cpu(cpu);
         self.events.push(SchedCoreEvent::CpuCurrentChange {
             cpu,
@@ -114,16 +116,17 @@ impl<S: Scheduler> SchedCore<S> {
 
         let maybe_next_task = self
             .ctx
-            .dsq_pop_front(self.ctx.per_cpu_dsq(cpu))
-            .or_else(|| self.ctx.dsq_pop_front(self.ctx.global_dsq()))
+            .dsq_pop(self.ctx.per_cpu_dsq(cpu))
+            .or_else(|| self.ctx.dsq_pop(self.ctx.global_dsq()))
             .or_else(|| {
                 self.scheduler.dispatch(&mut self.ctx, cpu);
-                self.ctx.dsq_pop_front(self.ctx.per_cpu_dsq(cpu))
+                self.ctx.dsq_pop(self.ctx.per_cpu_dsq(cpu))
             });
 
         if let Some(task) = maybe_next_task {
-            let prev_state = self.ctx.task_state(task);
+            let prev_state = self.ctx.task(task).state;
             self.ctx.set_running(cpu, task);
+            self.scheduler.running(&mut self.ctx, task);
 
             self.events.extend(vec![
                 SchedCoreEvent::TaskStateChange {
@@ -140,13 +143,19 @@ impl<S: Scheduler> SchedCore<S> {
         }
     }
 
+    pub fn create_task(&mut self, required_service: Ticks, weight: u64) -> TaskId {
+        let task = self.ctx.create_task(required_service, weight);
+        self.scheduler.enable(&mut self.ctx, task);
+        task
+    }
+
     pub fn wake_task(&mut self, task: TaskId, wakeup_cpu: CpuId) {
         self.ctx.mark_runnable(task);
 
         match self.scheduler.select_cpu(&mut self.ctx, task, wakeup_cpu) {
             SelectCpuDecision::DirectDispatch(cpu, slice) => {
                 let dsq = self.ctx.per_cpu_dsq(cpu);
-                self.ctx.dsq_push_back(dsq, task, slice);
+                self.ctx.dsq_push_fifo(dsq, task, slice);
             }
             SelectCpuDecision::EnqueueOn(cpu) => {
                 let flags: EnqueueFlags = SCX_ENQ_WAKEUP | SCX_ENQ_CPU_SELECTED;

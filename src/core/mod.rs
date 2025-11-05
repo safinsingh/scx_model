@@ -5,4 +5,4 @@ pub mod state;
 
 pub use driver::SchedCore;
 pub use event::SchedCoreEvent;
-pub use state::{CpuId, CpuState, Dsq, DsqId, KernelCtx, Task, TaskId, TaskState, Ticks};
+pub use state::{CpuId, CpuState, Dsq, DsqId, KernelCtx, Task, TaskId, TaskState, Ticks, Vtime};

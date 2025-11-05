@@ -7,6 +7,8 @@ pub struct Job {
     pub id: JobId,
     pub arrival_time: Ticks,
     pub run_time: Ticks,
+    // Range: 1..10000
+    pub weight: u64,
 }
 
 #[derive(Debug, Clone)]

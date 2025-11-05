@@ -49,7 +49,7 @@ impl Observer {
             );
             if let Some(dsq) = core.dsqs.get(dsq_id) {
                 debug_assert!(
-                    dsq.tasks.contains(tid),
+                    dsq.contains(*tid),
                     "task_to_dsq claims task {tid} in DSQ {dsq_id}, but queue does not contain it"
                 );
             } else {

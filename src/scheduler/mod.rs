@@ -1,10 +1,12 @@
 pub mod fifo;
+pub mod priq;
 
 use crate::core::{
     Ticks,
     state::{CpuId, KernelCtx, TaskId},
 };
 pub use fifo::FifoScheduler;
+pub use priq::PriqScheduler;
 
 pub type EnqueueFlags = u64;
 
@@ -46,6 +48,12 @@ pub trait Scheduler {
     fn enqueue(&mut self, ctx: &mut KernelCtx, task: TaskId, flags: EnqueueFlags, prev_cpu: CpuId);
 
     fn dispatch(&mut self, ctx: &mut KernelCtx, cpu: CpuId);
+
+    fn running(&mut self, _ctx: &mut KernelCtx, _task: TaskId) {}
+
+    fn stopping(&mut self, _ctx: &mut KernelCtx, _task: TaskId, _runnable: bool) {}
+
+    fn enable(&mut self, _ctx: &mut KernelCtx, _task: TaskId) {}
 
     fn tick(&mut self, _ctx: &mut KernelCtx, _task: TaskId) {}
 }
