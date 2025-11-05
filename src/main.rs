@@ -10,7 +10,7 @@ use scx_model::{
 use std::{cmp, ops::Range};
 
 fn main() {
-    let jobs = JobGenerator {
+    let job_cfg = JobGenerator {
         seed: 0,
         // Latest job arrival
         horizon: 1000,
@@ -18,12 +18,14 @@ fn main() {
         lambda: 1.0,
         // Proportion of heavy-weight jobs
         p_weighted: 0.3,
+        heavy_weight: 10000,
+        normal_weight: 100,
         // Simulate bimodal job length
         p_hit: 0.2,
         cache_hit_range: 1..3,
         cache_miss_range: 6..10,
-    }
-    .generate();
+    };
+    let jobs = job_cfg.generate();
     let num_cpus = 8;
     let mut sim = Sim::<PriqScheduler>::new(jobs, num_cpus);
 
@@ -54,11 +56,11 @@ fn main() {
     }
 
     let heavy_slowdowns = sim.jobs_filter_map(
-        |j| j.job.weight == 10000,
+        |j| j.job.weight == job_cfg.heavy_weight,
         |j| (j.completion_time.unwrap() as f64 - j.job.arrival_time as f64) / j.job.run_time as f64,
     );
     let normal_slowdowns = sim.jobs_filter_map(
-        |j| j.job.weight == 100,
+        |j| j.job.weight == job_cfg.normal_weight,
         |j| (j.completion_time.unwrap() as f64 - j.job.arrival_time as f64) / j.job.run_time as f64,
     );
 
@@ -68,28 +70,31 @@ fn main() {
 }
 
 /// HELPERS ///
-
+#[derive(Debug)]
 struct JobGenerator {
     seed: u64,
     horizon: Ticks,
     lambda: f64,
     p_weighted: f64,
+    heavy_weight: u64,
+    normal_weight: u64,
     p_hit: f64,
     cache_hit_range: Range<Ticks>,
     cache_miss_range: Range<Ticks>,
 }
 
 impl JobGenerator {
-    fn generate(self) -> Vec<Job> {
+    fn generate(&self) -> Vec<Job> {
         let Self {
             seed,
             horizon,
             lambda,
             p_weighted,
+            heavy_weight,
+            normal_weight,
             p_hit,
-            cache_hit_range,
-            cache_miss_range,
-        } = self;
+            ..
+        } = *self;
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let poisson = Poisson::new(lambda).expect("invalid lambda for Poisson");
@@ -101,14 +106,14 @@ impl JobGenerator {
             for _ in 0..arrivals {
                 let is_hit = rng.random_bool(p_hit);
                 let run_time = rng.random_range(if is_hit {
-                    cache_hit_range.clone()
+                    self.cache_hit_range.clone()
                 } else {
-                    cache_miss_range.clone()
+                    self.cache_miss_range.clone()
                 });
                 let weight = if rng.random_bool(p_weighted) {
-                    10000
+                    heavy_weight
                 } else {
-                    100
+                    normal_weight
                 };
 
                 jobs.push(Job {

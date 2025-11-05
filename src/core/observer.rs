@@ -14,37 +14,37 @@ impl Observer {
         self.step += 1;
 
         for cpu in &core.cpus {
-            if let Some(tid) = cpu.current {
-                let task = &core.tasks[tid];
+            if let Some(task_id) = cpu.current {
+                let task = core.task(task_id);
                 debug_assert_eq!(
                     task.state,
                     TaskState::Running,
-                    "cpu.current task {tid} must be Running"
+                    "cpu.current task {task_id} must be Running"
                 );
                 debug_assert_eq!(
                     task.current_cpu,
                     Some(cpu.id),
-                    "Task {tid} metadata current_cpu mismatch"
+                    "Task {task_id} metadata current_cpu mismatch"
                 );
             }
         }
 
-        for (&tid, &dsq_id) in &core.task_to_dsq {
-            let task = &core.tasks[tid];
+        for (&task_id, &dsq_id) in &core.task_to_dsq {
+            let task = core.task(task_id);
             debug_assert_ne!(
                 task.state,
                 TaskState::Completed,
-                "Completed task {tid} still present in DSQ {dsq_id:?}"
+                "Completed task {task_id} still present in DSQ {dsq_id:?}"
             );
             debug_assert_ne!(
                 task.state,
                 TaskState::Running,
-                "Running task {tid} must not appear in any DSQ"
+                "Running task {task_id} must not appear in any DSQ"
             );
             if let Some(dsq) = core.dsqs.get(dsq_id) {
                 debug_assert!(
-                    dsq.contains(tid),
-                    "task_to_dsq claims task {tid} in DSQ {dsq_id:?}, but queue does not contain it"
+                    dsq.contains(task_id),
+                    "task_to_dsq claims task {task_id} in DSQ {dsq_id:?}, but queue does not contain it"
                 );
             } else {
                 debug_assert!(false, "task_to_dsq references unknown DSQ {dsq_id:?}");
